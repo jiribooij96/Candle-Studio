@@ -24,7 +24,10 @@ Pick a preset, then adjust the sliders. The candle updates as you drag. **Surpri
 | | Length Ratio, Corner Round | Oval and rectangle: how long they are compared with their width. Straight-sided shapes: the radius of the rounded corners (a large value gives a soft, pebble-like shape) |
 | | Height, Diameter / Width, Top Size, Taper Curve, Top Edge Round | Overall shape. Width is measured across the flat sides; for a triangle or pentagon, from a flat side to the opposite corner. Set Top Size below 1 for a cone or pyramid |
 | Ribs, Twist & Sway | Ribs, Rib Depth, Rib Fullness | Number and depth of the lobes, spaced evenly around the outline. Fullness above 0 gives fat rope or flower lobes, below 0 gives thin fluted ridges |
+| | Rib Lean | Tilts every rib: one steep side and one gentle side, like overlapping folds or fins. The sign sets which way |
+| | Fade Bottom, Fade Top | The ribs ease out to a smooth surface over this share of the height (in %), at the bottom and/or the top |
 | | Twist | Full turns of spiral over the height. A negative value twists the other way. On a non-round shape the whole shape twists, so a square with Twist becomes a twisted square pillar |
+| | Twist Focus | Where the twist is tightest. 0 is even; a positive value is tight at the bottom and straightens out going up; a negative value is the reverse |
 | | Sway, Sway Waves, Phase, Stagger | Ribs swing left and right, like your first photo. With Stagger 1 the ribs drift out of sync for an organic look |
 | Waves & Bulges | S-Wave / Corkscrew | The whole candle bends side to side, or winds around in a helix |
 | | Soft / Bubbles | The width swells and narrows, or forms stacked bubbles |
@@ -35,6 +38,18 @@ The panel shows the wax needed (ml, and grams of soy wax at 0.86 g/ml) and, for 
 
 ![Base shapes](previews/base_shapes.png)
 *Top: the eight starting shapes (Round, Oval, Square, Rectangle, Triangle, Pentagon, Hexagon, Octagon). Bottom: the same shapes with 0.3 turns of Twist.*
+
+### Folds and fades
+
+![Folds and fades](previews/folds_and_fades.png)
+*Swirl Fade, Draped S-Curve and Wave Fins.*
+
+Leaning ribs give the layered, draped look of overlapping folds. Combine Rib Lean with a negative Rib Fullness for crisp edges:
+- **Swirl Fade**: folds swirl tightly at the bottom (Twist Focus) and fade into a smooth top (Fade Top 50%).
+- **Draped S-Curve**: leaning folds that sway over an S-bend.
+- **Wave Fins**: a short pillar of leaning fins with one wave.
+
+Where leaning ribs turn quickly, the add-on automatically adds extra rings so the steep sides stay smooth.
 
 Every pattern works on every shape: ribs, sway, waves and bubbles follow the outline. The presets Twisted Square, Twisted Hexagon, Twisted Triangle, Ribbed Oval and Square Cushions are good places to start. Keep a few millimetres of Corner Round: sharp corners chip easily and are hard to get out of a mold cleanly.
 
@@ -88,7 +103,7 @@ A classic block mold: two halves, 4 alignment pins and 4 printed screws. One end
 - Hang it in a jar by the rim while you pour. Pour at the low end of your wax's pouring temperature.
 
 ### Rigid mold
-- Print in PETG, because PLA softens around 60 °C. Use mold release, let the candle cool fully, then twist it out along the spiral. This also works for twisted squares, hexagons and other twisted shapes, as long as nothing sways, waves or bulges.
+- Print in PETG, because PLA softens around 60 °C. Use mold release, let the candle cool fully, then twist it out along the spiral. This also works for twisted squares, hexagons and other twisted shapes, as long as nothing sways, waves or bulges. The twist must be even (Twist Focus 0), and ribs mustn't fade at the top. A faded bottom is fine on a straight design, since it slides straight out.
 
 ## Export to Bambu Studio
 
@@ -118,6 +133,7 @@ A full run takes about 2 minutes. To run only some tests, name them (for example
 |---|---|
 | `geometry` | Every preset's candle, silicone kit, rigid and TPU mold is a clean, closed solid; operators, export and Load Design |
 | `two_part` | The release check (which presets release), both halves and the screws for every preset, M5 and clamp variants, thread clearance, the live lock painting |
-| `shapes` | Exact widths, straight flat sides, rib spacing, plain shapes releasing, and every mold for 7 shapes × 6 pattern mixes |
+| `shapes` | Exact widths, straight flat sides, rib spacing, plain shapes releasing, and every mold for 7 shapes × 7 pattern mixes |
+| `patterns` | Rib Lean, Fade and Twist Focus: what they do, that they change nothing at 0, the extra rings, the rigid-mold check, and every mold for the three fold presets |
 | `ui` | Panels for every shape and mold type, presets, Defaults, Surprise Me, saving and loading designs, the filament estimate |
 | `install` | Installs the file as a real add-on and exports every mold type |

@@ -14,7 +14,7 @@ printing, and watertight: every solid is built directly as a closed surface
 
 bl_info = {
     "name": "Candle Studio",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > Candle",
     "description": "Design swirl / wave pillar candles and export printable molds for Bambu Studio",
@@ -75,8 +75,8 @@ STRETCHED = ("OVAL", "RECTANGLE")
 SHAPE_DEFAULTS = dict(
     base_shape="ROUND", shape_stretch=1.5, corner_round=4.0,
     height=150.0, diameter=60.0, top_scale=1.0, taper_power=1.0, top_round=2.5,
-    ribs=8, rib_depth=4.0, rib_fullness=0.3,
-    twist_turns=0.0,
+    ribs=8, rib_depth=4.0, rib_fullness=0.3, rib_lean=0.0, fade_bottom=0.0, fade_top=0.0,
+    twist_turns=0.0, twist_focus=0.0,
     sway_angle=0.0, sway_waves=1.5, sway_phase=0.0, sway_stagger=0,
     wave_mode="PLANAR", wave_amount=0.0, wave_count=1.0, wave_phase=0.0, wave_direction=0.0,
     bulge_mode="SINE", bulge_amount=0.0, bulge_count=2.0, bulge_phase=0.0,
@@ -164,6 +164,17 @@ PRESETS = {
                         dict(base_shape="SQUARE", corner_round=12, ribs=0, bulge_mode="BUBBLE",
                              bulge_amount=0.2, bulge_count=3.6, bulge_phase=70, top_round=4,
                              color=PALETTE["blush"])),
+    "SWIRL_FADE": ("Swirl Fade", "Folds swirling tight at the bottom, fading into a smooth top",
+                   dict(height=93, ribs=8, rib_depth=7, rib_fullness=-0.3, rib_lean=0.5,
+                        twist_turns=0.75, twist_focus=0.8, fade_top=50, top_round=2,
+                        color=PALETTE["peach"])),
+    "DRAPED_S": ("Draped S-Curve", "Leaning folds flowing over an S-bend",
+                 dict(height=142, diameter=63, ribs=11, rib_depth=5.5, rib_fullness=-0.3, rib_lean=0.55,
+                      sway_angle=22, sway_waves=1.25, wave_amount=6, wave_count=1, top_round=1.5,
+                      color=PALETTE["peach"])),
+    "WAVE_FINS": ("Wave Fins", "Short pillar of leaning fins with one wave",
+                  dict(height=61, diameter=66, ribs=14, rib_depth=4.5, rib_fullness=-0.4, rib_lean=0.5,
+                       sway_angle=16, sway_waves=1.0, top_round=1.0, color=PALETTE["blush"])),
 }
 
 QUALITY = {  # segments around, ring spacing (mm)
@@ -276,6 +287,27 @@ def _outline_radius(p, t):
     return R
 
 
+def _twist_progress(p, t):
+    """Share of the twist done at normalised height t: even, or tighter
+    toward the bottom (focus > 0) or the top (focus < 0)."""
+    k = 1.0 + 2.0 * abs(p.twist_focus)
+    if p.twist_focus > 0:
+        return 1.0 - (1.0 - t) ** k
+    if p.twist_focus < 0:
+        return t ** k
+    return t
+
+
+def _rib_fade(p, t):
+    """Rib depth factor: 1, easing to 0 over the faded bottom / top share of the height."""
+    f = np.ones_like(t)
+    for share, x in ((p.fade_bottom, t), (p.fade_top, 1.0 - t)):
+        if share > 0:
+            x = np.clip(x / (0.01 * share), 0.0, 1.0)
+            f = f * x * x * (3.0 - 2.0 * x)
+    return f
+
+
 def radius_field(p, z, theta, inset=None):
     """Surface radius, shape (len(z), len(theta)). `inset` (mm per z) pulls
     the outline in, for the rounded top edge."""
@@ -287,7 +319,7 @@ def radius_field(p, z, theta, inset=None):
     if not ribs and p.base_shape == "ROUND":
         r = np.broadcast_to(R, shape).copy()
         return r if inset is None else r - inset[:, None]
-    phase = TAU * p.twist_turns * t  # twist and sway turn the whole cross-section
+    phase = TAU * p.twist_turns * _twist_progress(p, t)  # twist and sway turn the whole cross-section
     if p.sway_angle:
         phase = phase + math.radians(p.sway_angle) * np.sin(
             TAU * p.sway_waves * t + math.radians(p.sway_phase) + p.sway_stagger * th)
@@ -305,9 +337,17 @@ def radius_field(p, z, theta, inset=None):
                 rho[i] = _outline_radius_at(ang_i, pts_i, rel[i])
             inset = None
     if ribs:
-        s = np.clip(0.5 + 0.5 * np.cos(TAU * p.ribs * around), 0.0, 1.0)
+        if p.rib_lean:  # leaning ribs: one steep side, one gentle side, smooth all round
+            e = np.exp(1j * TAU * p.ribs * around)
+            b = 1j * p.rib_lean  # a disc automorphism bunches each cycle up on one side
+            w = (e - b) / (1.0 + b * e) * (1.0 + b) / (1.0 - b)  # (keeps the crest in place)
+            s = np.clip(0.5 + 0.5 * w.real, 0.0, 1.0)
+        else:
+            s = np.clip(0.5 + 0.5 * np.cos(TAU * p.ribs * around), 0.0, 1.0)
         profile = s ** (2.0 ** (-2.0 * p.rib_fullness))  # fullness>0: fat lobes, <0: thin ridges
         depth = min(p.rib_depth / (0.5 * p.diameter), 0.9 * rho_min)
+        if p.fade_bottom > 0 or p.fade_top > 0:
+            depth = depth * _rib_fade(p, t)
         r = R * (rho - depth * (1.0 - profile))
     else:
         r = np.broadcast_to(R * rho, shape).copy()
@@ -331,13 +371,29 @@ def wave_center(p, z):
     return np.column_stack([x, y])
 
 
+def _body_heights(p, top, step, segs):
+    """Ring heights from 0 to `top`: every `step` mm, but closer together where
+    leaning ribs turn quickly, so their steep sides don't zig-zag between rings
+    (the pattern turns at most one segment from one ring to the next)."""
+    zs = np.linspace(0.0, top, 2001)
+    speed = np.abs(np.gradient(TAU * p.twist_turns * _twist_progress(p, zs / p.height), zs))
+    if p.sway_angle:
+        speed = speed + math.radians(p.sway_angle) * TAU * p.sway_waves / p.height
+    density = np.maximum(1.0 / step, speed * segs / TAU)  # rings per mm
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(zs))])
+    return np.interp(np.linspace(0.0, cdf[-1], max(2, int(math.ceil(cdf[-1])) + 1)), cdf, zs)
+
+
 def candle_geometry(p, segs, step, wick_d=0.0):
     H = p.height
     theta = np.linspace(0.0, TAU, segs, endpoint=False)
     r_top = radius_field(p, [H], theta)[0]
     f = max(0.0, min(p.top_round, 0.25 * H, 0.45 * (r_top.min() - 0.5 * wick_d - 0.5)))
-    n_body = max(2, int(math.ceil((H - f) / step)) + 1)
-    z = np.linspace(0.0, H - f, n_body)
+    if p.rib_lean and p.ribs > 0:
+        z = _body_heights(p, H - f, step, segs)
+    else:
+        z = np.linspace(0.0, H - f, max(2, int(math.ceil((H - f) / step)) + 1))
+    n_body = len(z)
     inset = np.zeros(n_body)
     if f > 1e-3:  # rounded top edge: quarter circle of radius f
         k = max(3, int(math.ceil(0.5 * math.pi * f / step)))
@@ -388,6 +444,14 @@ def loft(rings, closed=False, cap_start=None, cap_end=None):
     quads = [np.stack([idx[:-1], nxt[:-1], nxt[1:], idx[1:]], -1).reshape(-1, 4)]
     if closed:
         quads.append(np.stack([idx[-1], nxt[-1], nxt[0], idx[0]], -1))
+    quads = np.vstack(quads)
+    # Quads get split along their 0-2 diagonal (here and in Blender). Start each
+    # quad so that diagonal joins the two corners at the most similar radius:
+    # the split then follows ridges and cliffs that run slanted across the rings,
+    # instead of cutting across them in a zig-zag.
+    rad = np.linalg.norm(rings[..., :2] - rings[..., :2].mean(axis=1, keepdims=True), axis=-1).ravel()
+    turn = np.abs(rad[quads[:, 0]] - rad[quads[:, 2]]) > np.abs(rad[quads[:, 1]] - rad[quads[:, 3]])
+    quads[turn] = quads[turn][:, [1, 2, 3, 0]]
     tris = []
     count = n * S
     if cap_start is not None:
@@ -397,8 +461,7 @@ def loft(rings, closed=False, cap_start=None, cap_end=None):
     if cap_end is not None:
         verts.append(np.asarray(cap_end, float)[None])
         tris.append(np.stack([np.full(S, count), idx[-1], nxt[-1]], -1))
-    return Mesh(np.vstack(verts), np.vstack(quads),
-                np.vstack(tris) if tris else np.zeros((0, 3), np.int64))
+    return Mesh(np.vstack(verts), quads, np.vstack(tris) if tris else np.zeros((0, 3), np.int64))
 
 
 def _ring(xy, z):
@@ -579,6 +642,11 @@ def rigid_mold_check(p):
         issues.append("bulges")
     if p.top_scale > 1.0:
         issues.append("wider top")
+    turning = p.twist_turns and (p.ribs > 0 and p.rib_depth > 0 or p.base_shape != "ROUND")
+    if turning and p.twist_focus:
+        issues.append("uneven twist")
+    if p.ribs > 0 and p.rib_depth > 0 and (p.fade_top > 0 or p.fade_bottom > 0 and p.twist_turns):
+        issues.append("rib fade")
     return issues
 
 
@@ -732,6 +800,31 @@ def _merge(meshes):
     return Mesh(np.vstack(verts), np.vstack(quads), np.vstack(tris))
 
 
+def _flip_needles(bm):
+    """Booleans can leave needle triangles (three corners almost in a line).
+    Flip the long edge of each, where that's safe: the far corners aren't
+    joined yet and the needle's middle corner lies between the edge's ends."""
+    for _ in range(4):
+        flipped = 0
+        for f in [f for f in bm.faces if f.calc_area() < 1e-6]:
+            if not f.is_valid:
+                continue
+            e = max(f.edges, key=lambda e: e.calc_length())
+            if not e.is_manifold or any(len(lf.verts) != 3 for lf in e.link_faces):
+                continue
+            v1, v2 = e.verts
+            a = next(v for v in f.verts if v not in e.verts)
+            b = next(v for v in next(lf for lf in e.link_faces if lf != f).verts if v not in e.verts)
+            if any(x.other_vert(a) == b for x in a.link_edges):
+                continue
+            d = v2.co - v1.co
+            if 0.0 < (a.co - v1.co).dot(d) / d.length_squared < 1.0 \
+                    and bmesh.utils.edge_rotate(e, True) is not None:
+                flipped += 1
+        if not flipped:
+            return
+
+
 def boolean_mesh(base, cut=(), add=()):
     """Blender boolean (Manifold solver when available) on our closed meshes."""
     temp_objs, temp_colls = [], []
@@ -774,6 +867,7 @@ def boolean_mesh(base, cut=(), add=()):
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-4)  # seams where cutters cross
         bmesh.ops.dissolve_degenerate(bm, dist=1e-4, edges=bm.edges)
         bmesh.ops.triangulate(bm, faces=bm.faces, quad_method="BEAUTY", ngon_method="BEAUTY")
+        _flip_needles(bm)
         verts = np.array([v.co[:] for v in bm.verts], float)
         bm.verts.index_update()
         tris = np.array([[v.index for v in f.verts] for f in bm.faces], np.int64)
@@ -815,6 +909,8 @@ def build_split_mold(p, m, g, angle_deg):
 
     base = _ring(rings[0][:, :2], -1.0)  # cavity pokes through the pour face
     candle = loft([base] + list(rings), cap_start=(*centers[0], -1.0), cap_end=(*centers[-1], H))
+    on_seam = np.abs(candle.verts[:, 0]) < 1e-6  # rounding left these a hair off the seam plane:
+    candle.verts[on_seam, 0] = 0.0                # exactly on it is clean, nearly on it leaves slivers
     wr = 0.5 * m.wick_diameter
     tc = centers[-1]
     th = np.linspace(0.0, TAU, 32, endpoint=False)
@@ -1009,7 +1105,7 @@ def _set_mesh(me, mesh):
         me["candle_key"] = key
     me.update()
     me.shade_smooth()
-    me.set_sharp_from_angle(angle=math.radians(40))
+    me.set_sharp_from_angle(angle=math.radians(60))  # crisp base / top edges, smooth steep ribs
 
 
 def _material(name, rgb, roughness=0.5, subsurface=0.0):
@@ -1262,6 +1358,11 @@ def random_design(rng, keep):
                  wave_mode=rng.choice(["PLANAR", "PLANAR", "HELIX"]),
                  wave_amount=rng.uniform(4, 9), wave_count=count,
                  sway_angle=rng.uniform(0, 15), sway_waves=count)
+    if family in ("twist", "sway", "wave") and rng.random() < 0.4:  # folds / fins
+        d.update(rib_lean=rng.uniform(0.3, 0.7) * rng.choice([-1, 1]),
+                 rib_fullness=rng.uniform(-0.6, 0.0))
+    if family == "twist" and rng.random() < 0.3:  # swirl that settles toward the top
+        d.update(twist_focus=rng.uniform(0.4, 0.9), fade_top=rng.uniform(25, 50))
     d["color"] = rng.choice(list(PALETTE.values()))
     return d
 
@@ -1308,9 +1409,23 @@ class CandleProps(bpy.types.PropertyGroup):
     rib_fullness: FloatProperty(name="Rib Fullness", default=0.3, min=-1.0, max=1.0, update=_on_change,
                                 description="+ fat round lobes with narrow grooves (rope / flower), "
                                             "- thin ridges with wide grooves (fluted)")
+    rib_lean: FloatProperty(name="Rib Lean", default=0.0, min=-0.8, max=0.8, update=_on_change,
+                            description="Tilts every rib: one steep side and one gentle side, like "
+                                        "overlapping folds or fins. 0 = symmetric; sign = direction")
+    fade_bottom: FloatProperty(name="Fade Bottom", subtype="PERCENTAGE", default=0.0, min=0.0, max=100.0,
+                               update=_on_change,
+                               description="Ribs ease out to a smooth surface over this share of the "
+                                           "height, at the bottom")
+    fade_top: FloatProperty(name="Fade Top", subtype="PERCENTAGE", default=0.0, min=0.0, max=100.0,
+                            update=_on_change,
+                            description="Ribs ease out to a smooth surface over this share of the "
+                                        "height, at the top")
     twist_turns: FloatProperty(name="Twist (turns)", default=0.0, min=-6.0, max=6.0, update=_on_change,
                                description="Full turns the ribs (and a non-round shape) spiral over "
                                            "the height; sign = direction")
+    twist_focus: FloatProperty(name="Twist Focus", default=0.0, min=-1.0, max=1.0, update=_on_change,
+                               description="Where the twist is tightest: 0 = even, + toward the bottom "
+                                           "(ribs straighten out going up), - toward the top")
     sway_angle: FloatProperty(name="Sway (deg)", default=0.0, min=0.0, max=90.0, update=_on_change,
                               description="Ribs swing left and right by this angle")
     sway_waves: FloatProperty(name="Sway Waves", default=1.5, min=0.1, max=12.0, update=_on_change,
@@ -1590,9 +1705,14 @@ class CANDLE_PT_ribs(_Panel, bpy.types.Panel):
     def draw(self, context):
         props = _props(context)
         col = self.layout.column(align=True)
-        for name in ("ribs", "rib_depth", "rib_fullness"):
+        for name in ("ribs", "rib_depth", "rib_fullness", "rib_lean"):
             col.prop(props, name)
-        self.layout.prop(props, "twist_turns")
+        row = self.layout.row(align=True)
+        row.prop(props, "fade_bottom")
+        row.prop(props, "fade_top")
+        col = self.layout.column(align=True)
+        col.prop(props, "twist_turns")
+        col.prop(props, "twist_focus")
         col = self.layout.column(align=True)
         for name in ("sway_angle", "sway_waves", "sway_phase", "sway_stagger"):
             col.prop(props, name)

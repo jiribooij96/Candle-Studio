@@ -83,6 +83,8 @@ CONFIGS = {
                          top_round=6),
     "rope corkscrew": dict(ribs=3, rib_depth=9, rib_fullness=0.75, twist_turns=1.5,
                            wave_mode="HELIX", wave_amount=4, wave_count=1.5),
+    "faded folds": dict(ribs=9, rib_depth=6, rib_fullness=-0.3, rib_lean=0.6, twist_turns=0.8,
+                        twist_focus=0.9, fade_bottom=15, fade_top=40),
 }
 t0 = time.time()
 for name in cs.BASE_SHAPES:
