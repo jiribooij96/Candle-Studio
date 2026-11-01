@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# exports and test output
+candle_exports/
+test_output/
+*.stl
+*.3mf
+*_design.json
