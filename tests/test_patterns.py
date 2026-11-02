@@ -65,7 +65,7 @@ for key in ("SWIRL_FADE", "DRAPED_S", "WAVE_FINS"):
     p, m = shape(cs, key), mold(cs)
     g = cs.candle_geometry(p, 180, 0.8, m.wick_diameter)
     check_mesh(fails, cs.build_candle(g), f"{key}/candle")
-    for mt in ("SILICONE", "RIGID", "FLEX", "SPLIT"):
+    for mt in ("SILICONE", "RIGID", "FLEX", "SPLIT", "WEDGE"):
         m.mold_type = mt
         for suffix, mesh in cs.mold_parts(p, m, g, 0.0 if mt == "SPLIT" else None):
             if suffix != "screws_x4":

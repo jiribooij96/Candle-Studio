@@ -8,13 +8,14 @@ Install:  Edit > Preferences > Add-ons > (v) menu > Install from Disk... > this 
 Use:      3D Viewport > press N > "Candle" tab.
 
 All dimensions are millimetres. Exported STL files are in mm, oriented for
-printing, and watertight: every solid is built directly as a closed surface
-(no boolean modifiers), so Bambu Studio has nothing to repair.
+printing, and watertight: every solid is built as a closed surface (only the
+two-part halves and the wedges are cut with Blender's boolean), so Bambu
+Studio has nothing to repair.
 """
 
 bl_info = {
     "name": "Candle Studio",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N) > Candle",
     "description": "Design swirl / wave pillar candles and export printable molds for Bambu Studio",
@@ -89,7 +90,7 @@ MOLD_DEFAULTS = dict(
     plate_thickness=3.0, step_height=4.0,
     mold_wall=4.0, mold_floor=3.0, flex_wall=1.8, flange_width=8.0, flange_thickness=2.0,
     split_wall=5.0, split_floor=4.0, fastener="PRINTED", split_auto=True, split_angle=0.0,
-    infill=15,
+    wedge_auto=True, wedge_count=4, infill=15,
 )
 
 # (label, description, overrides of SHAPE_DEFAULTS)
@@ -651,45 +652,108 @@ def rigid_mold_check(p):
 
 
 # ---------------------------------------------------------------------------
-# Two-part rigid mold
+# Release check (two-part and wedge molds)
 #
-# The halves meet on a flat seam through the candle axis and pull apart along
-# +u / -u. Along a line parallel to u inside a slice, mold material with candle
-# on its far side can't get out; that trapped length is the undercut we report,
-# and the surface points it touches are painted red.
+# Each mold piece pulls straight out, away from the candle axis; the halves of
+# the two-part mold are two pieces of 180 degrees. Within a slice, take lines
+# parallel to a piece's pull: its plastic on a line starts at its seam, and any
+# of it with candle further along the line is trapped. That trapped length is
+# the undercut we report, and the candle surface it catches on is painted red.
+# Only candle surface inside the piece that faces away from the pull can catch
+# it, so only lines across those spots are traced. The lines are 0.1 mm apart
+# and a hook has to span three of them: a sliver thinner than that, or a line
+# that just grazes the tip of a rib, isn't a lock.
 # ---------------------------------------------------------------------------
 
 LOCK_TOL = 0.3  # mm of undercut that wax shrinkage and mold release can live with
+PULL_LINE = 0.1  # mm between pull lines
+
+
+def _pull_frame(xy, beta, half):
+    """Slices xy (Z, S, 2) around the mold axis, seen from the piece whose
+    middle points along beta (half = half its angle): position along (a) and
+    across (w) its pull, the same for the next vertex, and the edges that face
+    away from the pull inside this piece (the only ones that can hook it)."""
+    u = np.array([math.cos(beta), math.sin(beta)])
+    a, w = xy @ u, xy @ np.array([-u[1], u[0]])
+    a1, w1 = np.roll(a, -1, -1), np.roll(w, -1, -1)
+    sh, ch = math.sin(half), math.cos(half)
+    inside = (a * sh > np.abs(w) * ch) | (a1 * sh > np.abs(w1) * ch)
+    return a, w, a1, w1, (w1 < w) & inside
+
+
+def _hooks(xy, beta, half):
+    """For that piece: (rows, w of the first line, trapped mm per row and
+    line, keeping only hooks at least 3 lines wide), in chunks of rows."""
+    a, w, a1, w1, hook = _pull_frame(xy, beta, half)
+    rows = np.flatnonzero(hook.any(1))
+    deep = np.where(hook, a - np.abs(w) / math.tan(half), -np.inf)[rows].max(1)
+    rows = rows[np.argsort(-deep)]  # likely-worst slices first, so a lock is found (and stops) early
+    span = max(1.0, float(np.ptp(w)) / PULL_LINE)
+    chunk = max(1, min(4, int(4e6 // (xy.shape[1] * span))))  # small arrays; a lock can stop early
+    for i in range(0, len(rows), chunk):
+        r = rows[i:i + chunk]
+        lo = np.where(hook[r], np.minimum(w[r], w1[r]), np.inf).min()
+        hi = np.where(hook[r], np.maximum(w[r], w1[r]), -np.inf).max()
+        W = np.arange(math.floor(lo / PULL_LINE), math.ceil(hi / PULL_LINE) + 1) * PULL_LINE
+        L = W[None, :, None]
+        W0, W1 = w[r][:, None, :], w1[r][:, None, :]
+        cross = (W0 <= L) != (W1 <= L)  # a vertex exactly on a line counts once
+        s = np.where(cross, (L - W0) / np.where(cross, W1 - W0, 1.0), 0.0)
+        ac = a[r][:, None, :] + s * (a1 - a)[r][:, None, :]
+        sign = np.where(cross, np.sign(W1 - W0), 0.0)  # +1 leaving the candle, -1 entering
+        a0 = (np.abs(W) / math.tan(half))[None, :, None]  # where the line enters the piece
+        amax = np.where(cross, ac, -np.inf).max(-1)
+        trap = np.maximum(amax - a0[..., 0], 0.0) - (sign * np.maximum(ac, a0)).sum(-1)
+        trap = np.pad(np.where(np.isfinite(amax), trap, 0.0), ((0, 0), (1, 1)))
+        yield r, W[0], np.minimum(np.minimum(trap[:, :-2], trap[:, 1:-1]), trap[:, 2:])
+
+
+def pieces_trapped(xy, n, phi, stop=np.inf):
+    """Worst trapped length (mm) of n equal pieces with seams at
+    phi + k * 360/n deg (phi in radians). Stops early once it reaches `stop`."""
+    half, worst = math.pi / n, 0.0
+    for k in range(n):
+        for _, _, trap in _hooks(xy, phi + (2 * k + 1) * half, half):
+            worst = max(worst, float(trap.max()))
+            if worst >= stop:
+                return worst
+    return worst
+
+
+def _hook_mask(xy, n, phi, tol=LOCK_TOL):
+    """Per vertex of slices xy: True on candle surface that hooks the piece it
+    touches - both ends of every edge with a deep enough hook across it."""
+    half = math.pi / n
+    along = np.linspace(0.0, 1.0, 5)  # sample points across each edge
+    out = np.zeros(xy.shape[:2], bool)
+    for k in range(n):
+        beta = phi + (2 * k + 1) * half
+        _, w, _, w1, hook = _pull_frame(xy, beta, half)
+        for rows, w0, trap in _hooks(xy, beta, half):
+            ws = w[rows][..., None] + along * (w1 - w)[rows][..., None]
+            j = np.clip(np.rint((ws - w0) / PULL_LINE).astype(int), 0, trap.shape[1] - 1)
+            deep = np.take_along_axis(trap, j.reshape(len(rows), -1), 1).reshape(j.shape).max(-1) > tol
+            edge = hook[rows] & deep
+            out[rows] |= edge | np.roll(edge, 1, axis=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Two-part rigid mold
+#
+# The halves meet on a flat seam through the candle axis and pull apart along
+# +u / -u.
+# ---------------------------------------------------------------------------
+
 SCREW = dict(major=8.0, pitch=2.5, depth=1.2, clearance=0.35, head_d=14.0, head_h=5.0)
 PIN_R, PIN_LEN = 3.0, 4.0
 
 
-def _frame(xy, phi):
-    u = np.array([math.cos(phi), math.sin(phi)])
-    return xy @ u, xy @ np.array([-u[1], u[0]])
-
-
-def _line_traps(a, w):
-    """Pull-direction lines through every outline vertex (a: along the pull,
-    w: across it; shape (..., S)). Returns the trapped mold length on each
-    line and the crossings, for the `lock_mask` ray test."""
-    a1, w1 = np.roll(a, -1, -1), np.roll(w, -1, -1)
-    L = (w + 1e-6)[..., :, None]  # nudged so the line never runs exactly through a vertex
-    W0, W1 = w[..., None, :], w1[..., None, :]
-    cross = (W0 - L) * (W1 - L) < 0
-    s = np.where(cross, (L - W0) / np.where(W1 == W0, 1.0, W1 - W0), 0.0)
-    ac = a[..., None, :] + s * (a1 - a)[..., None, :]
-    sign = np.where(cross, np.sign(W1 - W0), 0.0)  # +1 leaving the candle, -1 entering
-    amax = np.where(cross, ac, -np.inf).max(-1)
-    amin = np.where(cross, ac, np.inf).min(-1)
-    trap_a = np.maximum(amax, 0.0) - (sign * np.maximum(ac, 0.0)).sum(-1)
-    trap_b = np.maximum(-amin, 0.0) - (sign * np.minimum(ac, 0.0)).sum(-1)
-    return np.maximum(trap_a, trap_b), ac, cross
-
-
-def split_trapped(rings_xy, phi):
-    """Worst trapped length (mm) over all slices for a seam at angle phi."""
-    return float(_line_traps(*_frame(rings_xy, phi))[0].max())
+def split_trapped(rings_xy, phi, stop=np.inf):
+    """Worst trapped length (mm) over all slices for a seam at angle phi (the
+    halves pull along phi and phi + 180 deg)."""
+    return pieces_trapped(rings_xy, 2, phi - 0.5 * math.pi, stop)
 
 
 def best_split(p, step_deg=5.0):
@@ -704,28 +768,30 @@ def best_split(p, step_deg=5.0):
             period = min(180.0, 360.0 / p.ribs)
         elif fold and not (p.sway_angle and p.sway_stagger):
             period = min(180.0, 360.0 / (math.gcd(fold, p.ribs) if p.ribs > 0 else fold))
-    coarse = np.arange(0.0, period, step_deg)
+    turned = abs(p.twist_turns) * 360.0 + 2.0 * p.sway_angle >= period  # every seam angle occurs
+    coarse = np.arange(0.0, period, period / 6.0 if turned else step_deg)
     if fold:  # straight-sided shapes release only within ~0.5 deg of a mirror line
         coarse = np.concatenate([np.arange(0.0, 180.0, 90.0 / fold), coarse])
-    scores = [split_trapped(xy, math.radians(d)) for d in coarse]
-    best = float(coarse[int(np.argmin(scores))])
-    fine = best + np.concatenate([[0.0], np.arange(1.0 - step_deg, step_deg, 1.0)])
-    scores = [split_trapped(xy, math.radians(d)) for d in fine]
-    i = int(np.argmin(scores))
-    return float(fine[i] % 180.0), scores[i]
+
+    def least(angles):
+        top, at = np.inf, float(angles[0])
+        for d in angles:
+            t = split_trapped(xy, math.radians(d), top)
+            if t < top:
+                top, at = t, float(d)
+            if top == 0.0:
+                break
+        return at, top
+
+    best, score = least(coarse)
+    if score > 0.0 and not turned:
+        best, score = least(best + np.concatenate([[0.0], np.arange(1.0 - step_deg, step_deg, 1.0)]))
+    return best % 180.0, score
 
 
 def lock_mask(g, phi, tol=LOCK_TOL):
-    """Per ring vertex: True where the candle hooks into its mold half - its
-    line traps mold, and looking along its half's pull it sees more candle."""
-    out = np.zeros(g.rings.shape[:2], bool)
-    for i, ring in enumerate(g.rings):
-        a, w = _frame(ring[:, :2], phi)
-        trapped, ac, cross = _line_traps(a, w)
-        up = (cross & (ac > a[:, None] + tol)).any(1)
-        down = (cross & (ac < a[:, None] - tol)).any(1)
-        out[i] = (trapped > tol) & np.where(a >= 0, up, down)
-    return out
+    """Per ring vertex: True where the candle hooks into its mold half."""
+    return _hook_mask(g.rings[..., :2], 2, phi - 0.5 * math.pi, tol)
 
 
 def _rod(profile, segs=32):
@@ -952,12 +1018,172 @@ def build_split_mold(p, m, g, angle_deg):
     return [("half_a", place_for_print(half_a)), ("half_b", place_for_print(half_b))] + extra
 
 
-def mold_parts(p, m, g, split_angle=None):
-    """[(file suffix, Mesh)] oriented and placed for printing."""
+# ---------------------------------------------------------------------------
+# Wedge mold
+#
+# A round sleeve cut into 3 to 6 equal wedges through the mold axis, plus a
+# plug that carries the candle's top (with its rounded edge) and the wick hole.
+# A tongue around the plug sits in a groove inside the wedges; rubber bands in
+# the grooves outside hold everything together. Each wedge pulls straight out
+# along its middle; the release check is the one above.
+# ---------------------------------------------------------------------------
+
+WEDGE_COUNTS = (3, 4, 5, 6)
+PLUG_WALL, PLUG_FIT = 2.5, 0.25  # plug rim beyond the candle top; gap between plug and socket
+TONGUE = (1.2, 1.6, 0.4)  # height, half-width at its base and at its top (45 deg flanks)
+BAND_GROOVE = 1.5  # depth of the V-grooves for the rubber bands
+
+
+def _plug_face(g):
+    """Index of the first ring the plug carries: where the rounded top edge
+    starts, or higher up while the candle is still getting wider (the plug has
+    to lift straight off the top)."""
+    i = len(g.z) - 1
+    while i > g.n_body - 1 and np.all(g.r[i - 1] >= g.r[i] - 1e-9):
+        i -= 1
+    return i
+
+
+def _wedge_slices(p):
+    """Check slices around the mold axis; the plug carries the top."""
+    g = candle_geometry(p, 96, 2.0)
+    c, _ = bounding_circle(g.rings[..., :2])
+    return g.rings[:_plug_face(g) + 1, :, :2] - c
+
+
+def best_wedges(p, count=None):
+    """(pieces, seam angle in degrees, worst trapped mm): the fewest pieces
+    that release (or exactly `count`), with the seams where they trap least."""
+    xy = _wedge_slices(p)
+    fold = _shape_fold(p)
+    best = None
+    for n in (count,) if count else WEDGE_COUNTS:
+        period = 360.0 / n
+        turned = abs(p.twist_turns) * 360.0 + 2.0 * p.sway_angle >= period  # every seam angle occurs
+        angles = list(np.arange(0.0, period, period / (3 if turned else 8)))
+        if p.ribs > 0:  # seams on a crest or in a groove
+            angles += list(np.arange(0.0, period, 180.0 / p.ribs))
+        if fold:  # or on a corner or a flat
+            angles += list(np.arange(0.0, period, 90.0 / fold))
+        top, at = np.inf, 0.0
+        for a in sorted({round(float(x), 6) for x in angles}):
+            t = pieces_trapped(xy, n, math.radians(a), top)
+            if t < top:
+                top, at = t, a
+            if top == 0.0:
+                break
+        if best is None or top < best[2]:
+            best = (n, at, top)
+        if top <= LOCK_TOL:
+            break
+    return best
+
+
+def wedge_lock_mask(g, n, phi, tol=LOCK_TOL):
+    """Per ring vertex: True where the candle hooks the wedge it touches."""
+    c, _ = bounding_circle(g.rings[..., :2])
+    face = _plug_face(g)
+    out = np.zeros(g.rings.shape[:2], bool)
+    out[:face + 1] = _hook_mask(g.rings[:face + 1, :, :2] - c, n, phi, tol)
+    return out
+
+
+def _wedge_layout(g, m):
+    """Mold axis and sizes, in candle coordinates (base at z = 0, top at H)."""
+    c, rmax = bounding_circle(g.rings[..., :2])
+    face = _plug_face(g)
+    z_face = float(g.z[face])
+    R_plug = float(np.linalg.norm(g.rings[face:, :, :2] - c, axis=-1).max()) + PLUG_WALL
+    z_end = max(g.H + m.split_floor, z_face + 6.0)
+    lo, hi = 2.0 + BAND_GROOVE, z_face - 2.0 - BAND_GROOVE  # rubber band grooves, clear of the socket
+    bands = list(np.linspace(lo, hi, int((hi - lo) // 70.0) + 2)) if hi - lo > 12.0 else [0.5 * z_face]
+    return SimpleNamespace(c=c, face=face, z_face=z_face, z_end=z_end, zt=0.5 * (z_face + z_end),
+                           R_plug=R_plug, R_sock=R_plug + PLUG_FIT, bands=bands,
+                           Rm=max(rmax + m.split_wall + BAND_GROOVE, R_plug + PLUG_FIT + TONGUE[0] + 3.0))
+
+
+def _wedge_block(L, a0, a1):
+    """Solid sector of the sleeve between angles a0 and a1, with the band grooves."""
+    t = np.linspace(a0, a1, max(8, int(math.ceil(math.degrees(a1 - a0) / 1.5))) + 1)
+    d = np.column_stack([np.cos(t), np.sin(t)])
+    prof = [(0.0, L.Rm)]
+    for zb in L.bands:
+        prof += [(zb - BAND_GROOVE, L.Rm), (zb, L.Rm - BAND_GROOVE), (zb + BAND_GROOVE, L.Rm)]
+    prof.append((L.z_end, L.Rm))
+    mid = L.c + 0.5 * L.Rm * np.array([math.cos(0.5 * (a0 + a1)), math.sin(0.5 * (a0 + a1))])
+    return loft([_ring(np.vstack([L.c, L.c + R * d]), z) for z, R in prof],
+                cap_start=(*mid, 0.0), cap_end=(*mid, L.z_end))
+
+
+def _socket_profile(L, grow):
+    """(z, radius) of the plug's side with its tongue, grown by `grow` (the
+    gap for the socket); 45 deg flanks stay 45 deg."""
+    h, base, tip = TONGUE
+    e = grow * (math.sqrt(2.0) - 1.0)  # how much wider a 45 deg flank gets when grown
+    R = L.R_plug + grow
+    return [(L.zt - base - e, R), (L.zt - tip - e, R + h), (L.zt + tip + e, R + h), (L.zt + base + e, R)]
+
+
+def build_wedge_plug(g, m, L):
+    """The plug: the candle's top and rounded edge as a recess, the wick hole,
+    and the tongue around its side. Built upright; printed face up."""
+    th, i, H = g.theta, L.face, g.H
+    tc = g.centers[-1]
+    prof = [(L.z_face, L.R_plug)] + _socket_profile(L, 0.0) + [(L.z_end, L.R_plug)]
+    rings = [g.rings[i]] + [circle_ring(tc, L.c, r, th, z) for z, r in prof]
+    rings += [disc_ring(tc, 0.5 * m.wick_diameter, th, L.z_end), disc_ring(tc, 0.5 * m.wick_diameter, th, H)]
+    rings += list(g.rings[:i:-1])
+    return loft(rings, closed=True)
+
+
+def _wedge_cutters(g, L, phi, n):
+    """The candle (through the pour face and on into the socket) and the socket
+    with its groove. Socket corners sit halfway between the seams."""
+    i = L.face
+    rings = [_ring(g.rings[0][:, :2], -1.0)] + list(g.rings[:i + 1])
+    rings.append(_ring(g.rings[i][:, :2], L.z_face + 1.0))
+    candle = loft(rings, cap_start=(*g.centers[0], -1.0), cap_end=(*g.centers[i], L.z_face + 1.0))
+    xy = candle.verts[:, :2]  # a vertex (almost) in a seam plane leaves slivers: keep them 0.02 mm clear
+    for k in range(n):
+        s = phi + k * TAU / n
+        out, nrm = np.array([math.cos(s), math.sin(s)]), np.array([-math.sin(s), math.cos(s)])
+        d = (xy - L.c) @ nrm
+        near = ((xy - L.c) @ out > 0) & (np.abs(d) < 0.02)
+        xy[near] += (np.where(d[near] >= 0, 0.02, -0.02) - d[near])[:, None] * nrm
+    th = phi + (np.arange(240) + 0.5) * (TAU / 240)
+    prof = [(L.z_face, L.R_sock)] + _socket_profile(L, PLUG_FIT) + [(L.z_end + 1.0, L.R_sock)]
+    socket = loft([circle_ring(L.c, L.c, r, th, z) for z, r in prof],
+                  cap_start=(*L.c, L.z_face), cap_end=(*L.c, L.z_end + 1.0))
+    return candle, socket
+
+
+def build_wedge_mold(p, m, g, n, angle_deg):
+    """n wedges and the plug, placed for printing: wedges standing on the
+    pour end, the plug face up."""
+    L = _wedge_layout(g, m)
+    # half a vertex step off the checked seam, so no candle vertex lies (almost) in a seam plane
+    phi = math.radians(angle_deg) + math.pi / len(g.theta)
+    cuts = _wedge_cutters(g, L, phi, n)
+    parts = []
+    for k in range(n):
+        a0 = phi + k * TAU / n
+        wedge = boolean_mesh(_wedge_block(L, a0, a0 + TAU / n), cut=cuts)
+        parts.append((f"wedge_{k + 1}", place_for_print(wedge)))
+    plug = build_wedge_plug(g, m, L)
+    return parts + [("plug", place_for_print(plug, flip=True))]
+
+
+def mold_parts(p, m, g, split_angle=None, wedges=None):
+    """[(file suffix, Mesh)] oriented and placed for printing. wedges:
+    (pieces, seam angle), found with best_wedges if not given."""
     if m.mold_type == "SPLIT":
         if split_angle is None:
             split_angle = best_split(p)[0] if m.split_auto else m.split_angle
         return build_split_mold(p, m, g, split_angle)
+    if m.mold_type == "WEDGE":
+        if wedges is None:
+            wedges = best_wedges(p, None if m.wedge_auto else m.wedge_count)[:2]
+        return build_wedge_mold(p, m, g, *wedges)
     if m.mold_type == "SILICONE":
         master, sleeve, _ = build_silicone_kit(p, m, g)
         return [("master", master), ("sleeve", sleeve)]
@@ -976,10 +1202,11 @@ def mold_parts(p, m, g, split_angle=None):
 # ---------------------------------------------------------------------------
 
 SHELL_MM = 0.85  # Bambu Studio defaults: 2 walls of 0.42 mm, 1.0 mm top and 0.6 mm bottom layers
-PRINT_MATERIAL = {"SILICONE": ("PLA", 1.24), "SPLIT": ("PLA/PETG", 1.25),
+PRINT_MATERIAL = {"SILICONE": ("PLA", 1.24), "SPLIT": ("PLA/PETG", 1.25), "WEDGE": ("PLA/PETG", 1.25),
                   "FLEX": ("TPU", 1.21), "RIGID": ("PETG", 1.27)}
 PART_NAMES = {"master": "master", "sleeve": "sleeve", "half_a": "half A", "half_b": "half B",
-              "screws_x4": "4 screws", "mold_rigid": "mold", "mold_flex": "mold"}
+              "screws_x4": "4 screws", "mold_rigid": "mold", "mold_flex": "mold", "plug": "plug",
+              **{f"wedge_{k}": f"wedge {k}" for k in range(1, max(WEDGE_COUNTS) + 1)}}
 
 
 def print_grams(volume, area, infill, density):
@@ -991,10 +1218,58 @@ def print_grams(volume, area, infill, density):
     return (shell + infill * inside) * density / 1000.0
 
 
-def print_parts(p, m, g, split_angle=0.0):
+def _wedge_parts(g, m, n, angle_deg):
+    """Volume and surface of each wedge from the sleeve and the candle slices
+    it holds (no booleans); the plug is built directly, so it is exact."""
+    L = _wedge_layout(g, m)
+    nb, half, phi = L.face + 1, math.pi / n, math.radians(angle_deg)
+    P, C = g.rings[:nb, :, :2] - L.c, g.centers[:nb, None, :] - L.c
+    a, b = P - C, np.roll(P, -1, axis=1) - C
+    fan = 0.5 * (a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0])  # slice area as triangles from its centre
+
+    def sector(xy):
+        return np.floor(np.mod(np.arctan2(xy[..., 1], xy[..., 0]) - phi, TAU) / (2.0 * half)).astype(int) % n
+
+    k_fan = sector(3.0 * C + a + b)  # by the triangle's centroid (times 3)
+    A = g.rings[:nb]
+    B = np.roll(A, -1, axis=1)
+    side = 0.5 * np.linalg.norm(np.cross(B[1:] - A[:-1], A[1:] - B[:-1]), axis=-1)  # candle wall quads
+    k_side = sector(A[:-1, :, :2] + B[1:, :, :2] - 2.0 * L.c)
+    dz = np.diff(g.z[:nb])
+    wz = 0.5 * (np.concatenate([dz, [0.0]]) + np.concatenate([[0.0], dz]))  # trapezoid weights
+    ang, rad = np.mod(np.arctan2(P[..., 1], P[..., 0]), TAU), np.linalg.norm(P, axis=-1)
+    order = np.argsort(ang, axis=1)
+    ang, rad = np.take_along_axis(ang, order, 1), np.take_along_axis(rad, order, 1)
+    T, Rm, Rs = L.z_end - L.z_face, L.Rm, L.R_sock
+    h, base, tip = TONGUE
+    e = PLUG_FIT * (math.sqrt(2.0) - 1.0)
+    groove = h * (base + tip + 2.0 * e)  # cross-section of the tongue groove
+    v_bands = len(L.bands) * BAND_GROOVE ** 2 * 2.0 * half * (Rm - BAND_GROOVE / 3.0)
+    s_bands = len(L.bands) * 2.0 * BAND_GROOVE * (math.sqrt(2.0) - 1.0) * 2.0 * half * Rm
+    parts = []
+    for k in range(n):
+        held = (fan * (k_fan == k)).sum(axis=1)  # candle area in this wedge, per slice
+        seams = sum(((Rm - np.array([np.interp(np.mod(s, TAU), a, r, period=TAU) for a, r in zip(ang, rad)]))
+                     * wz).sum() for s in (phi + 2 * k * half, phi + 2 * (k + 1) * half))
+        vol = (half * Rm * Rm * L.z_face - (held * wz).sum() + half * (Rm * Rm - Rs * Rs) * T
+               - v_bands - groove * 2.0 * half * (Rs + 0.5 * h))
+        area = (2.0 * half * Rm * L.z_end + s_bands + seams + 2.0 * (Rm - Rs) * T
+                + side[k_side == k].sum() + 2.0 * half * Rm * Rm - held[0] - held[-1]
+                + 2.0 * half * Rs * (T + 2.0 * (math.sqrt(2.0) - 1.0) * h))
+        parts.append((f"wedge_{k + 1}", vol, area, False))
+    plug = build_wedge_plug(g, m, L)
+    return parts + [("plug", plug.volume(), plug.area(), False)]
+
+
+def print_parts(p, m, g, split_angle=0.0, wedges=None):
     """[(part, volume mm3, surface mm2, printed solid)] for the estimate. The
-    two-part halves are worked out from the block and cavity sizes, so no
-    booleans are needed and it is quick enough to run while designing."""
+    two-part halves and the wedges are worked out from the block and cavity
+    sizes, so no booleans are needed and it is quick enough to run while
+    designing."""
+    if m.mold_type == "WEDGE":
+        if wedges is None:
+            wedges = best_wedges(p, None if m.wedge_auto else m.wedge_count)[:2]
+        return _wedge_parts(g, m, *wedges)
     if m.mold_type == "SPLIT":
         L = _split_layout(g, m, split_angle)
         candle = build_candle(g)
@@ -1065,7 +1340,8 @@ def open_in_bambu(paths):
 COLLECTION = "Candle Studio"
 OBJ_CANDLE, OBJ_WICK = "Candle", "Candle Wick"
 OBJ_MOLDS = ("Candle Master", "Candle Sleeve", "Candle Mold",
-             "Candle Mold A", "Candle Mold B", "Candle Screws")
+             "Candle Mold A", "Candle Mold B", "Candle Screws", "Candle Plug",
+             *(f"Candle Wedge {k}" for k in range(1, max(WEDGE_COUNTS) + 1)))
 _suspend = [False]
 _stats = {}
 
@@ -1165,11 +1441,11 @@ def update_candle(scene):
     _stats.update(height=p.height, dia=2.0 * rmax, base_x=base_x, base_y=base_y, ml=vol, wax=vol * 0.86,
                   silicone=(math.pi * Ri * Ri * (p.height + m.sil_top)) / 1000.0 - vol)
 
-    locks = m.mold_type == "SPLIT" and props.show_locks
+    locks = m.mold_type in ("SPLIT", "WEDGE") and props.show_locks
     if locks:  # plain wax colour while sliders move; red zones follow once you pause
         _paint_locks(obj.data, p.color, None)
-    _stats.pop("split", None)
-    _stats.pop("print", None)
+    for key in ("split", "wedge", "print"):
+        _stats.pop(key, None)
     _schedule_mold_checks()
     _set_lock_view(locks)
     return obj
@@ -1227,12 +1503,29 @@ def run_split_check(scene):
     return _stats["split"]
 
 
-def run_print_estimate(scene, split_angle=0.0):
+def run_wedge_check(scene):
+    """Find how many wedges release (or check the chosen count), store the
+    result and paint the lock zones on the viewport candle."""
+    props = scene.candle_studio
+    p, m = _snapshot(props)
+    n, angle, trapped = best_wedges(p, None if m.wedge_auto else m.wedge_count)
+    _stats["wedge"] = dict(pieces=n, angle=angle, trapped=trapped, ok=trapped <= LOCK_TOL)
+    obj = scene.objects.get(OBJ_CANDLE)
+    if obj is not None and props.show_locks:
+        mask = None
+        if trapped > LOCK_TOL:
+            g = candle_geometry(p, props.preview_segments, props.preview_step, m.wick_diameter)
+            mask = wedge_lock_mask(g, n, math.radians(angle))
+        _paint_locks(obj.data, p.color, mask)
+    return _stats["wedge"]
+
+
+def run_print_estimate(scene, split_angle=0.0, wedges=None):
     """Store the printed parts' volume and surface for the filament estimate."""
     props = scene.candle_studio
     p, m = _snapshot(props)
     g = candle_geometry(p, props.preview_segments, props.preview_step, m.wick_diameter)
-    _stats["print"] = print_parts(p, m, g, split_angle)
+    _stats["print"] = print_parts(p, m, g, split_angle, wedges)
     return _stats["print"]
 
 
@@ -1240,10 +1533,13 @@ def _mold_timer():
     """Runs a moment after the sliders stop: release check and print estimate."""
     scene = bpy.context.scene
     if scene is not None and hasattr(scene, "candle_studio"):
-        angle = 0.0
+        angle, wedges = 0.0, None
         if scene.candle_studio.mold_type == "SPLIT":
             angle = run_split_check(scene)["angle"]
-        run_print_estimate(scene, angle)
+        elif scene.candle_studio.mold_type == "WEDGE":
+            res = run_wedge_check(scene)
+            wedges = (res["pieces"], res["angle"])
+        run_print_estimate(scene, angle, wedges)
         for area in _view3d_spaces():
             area.tag_redraw()
     return None
@@ -1271,12 +1567,15 @@ def update_mold_preview(scene):
         return []
     names = {"master": "Candle Master", "sleeve": "Candle Sleeve",
              "mold_rigid": "Candle Mold", "mold_flex": "Candle Mold",
-             "half_a": "Candle Mold A", "half_b": "Candle Mold B", "screws_x4": "Candle Screws"}
+             "half_a": "Candle Mold A", "half_b": "Candle Mold B", "screws_x4": "Candle Screws",
+             "plug": "Candle Plug",
+             **{f"wedge_{k}": f"Candle Wedge {k}" for k in range(1, max(WEDGE_COUNTS) + 1)}}
     mat = _material("Candle Mold Print", _hex("7FB8B0"), roughness=0.6)
     created = []
     x = rmax + 2.0 * (rmax + m.sil_wall) + 20.0
     angle = run_split_check(scene)["angle"] if m.mold_type == "SPLIT" else None
-    for suffix, mesh in mold_parts(p, m, g, angle):
+    res = run_wedge_check(scene) if m.mold_type == "WEDGE" else None
+    for suffix, mesh in mold_parts(p, m, g, angle, res and (res["pieces"], res["angle"])):
         obj = _object(scene, names[suffix])
         _set_mesh(obj.data, mesh)
         _assign(obj, mat)
@@ -1469,6 +1768,9 @@ class CandleProps(bpy.types.PropertyGroup):
                                           "Works for every design"),
         ("SPLIT", "Printed two-part mold", "Two halves held by screws, like a classic block mold. "
                                            "Only for shapes that release - the panel checks"),
+        ("WEDGE", "Printed wedge mold (3-6 pieces)", "A sleeve split into 3 to 6 wedges plus an end plug, "
+                                                     "held by rubber bands. Releases most twisted "
+                                                     "designs - the panel checks"),
         ("FLEX", "Printed flexible mold (TPU)", "Thin shell that follows the candle; peel it off"),
         ("RIGID", "Printed rigid mold (PETG)", "One-piece block; only for twist-only designs, "
                                                "the candle unscrews out"),
@@ -1490,9 +1792,9 @@ class CandleProps(bpy.types.PropertyGroup):
                                 description="Rim around the opening; 0 = none")
     flange_thickness: FloatProperty(name="Flange Thickness (mm)", default=2.0, min=1.0, max=8.0)
     split_wall: FloatProperty(name="Min Wall (mm)", default=5.0, min=2.0, max=30.0,
-                              description="Plastic between the candle and the outside of the block")
+                              description="Plastic between the candle and the outside of the mold")
     split_floor: FloatProperty(name="Floor (mm)", default=4.0, min=2.0, max=20.0,
-                               description="Block thickness beyond the candle top (wick end)")
+                               description="Mold thickness beyond the candle top (wick end)")
     fastener: EnumProperty(name="Hold Together", default="PRINTED", items=[
         ("PRINTED", "Printed screws", "4 printed 8 mm screws, threads printed into half A"),
         ("M5", "M5 bolts + nuts", "Through holes with hex nut pockets in half A"),
@@ -1501,9 +1803,14 @@ class CandleProps(bpy.types.PropertyGroup):
                              description="Turn the seam to the angle where the candle releases best")
     split_angle: FloatProperty(name="Seam Angle (deg)", default=0.0, min=0.0, max=180.0,
                                update=_on_change)
+    wedge_auto: BoolProperty(name="Auto Pieces", default=True, update=_on_change,
+                             description="Use the fewest wedges (3 to 6) that release the candle")
+    wedge_count: IntProperty(name="Pieces", default=4, min=3, max=6, update=_on_change,
+                             description="Number of wedges; more pieces release deeper and "
+                                         "twistier designs, but leave more seam lines")
     show_locks: BoolProperty(name="Show Lock Areas", default=True, update=_on_change,
                              description="Paint the places where the candle would grip a two-part "
-                                         "mold red (viewport colour switches to Attribute)")
+                                         "or wedge mold red (viewport colour switches to Attribute)")
     infill: IntProperty(name="Infill", subtype="PERCENTAGE", default=15, min=0, max=100,
                         description="Sparse infill used for the filament estimate. 10-15% is plenty "
                                     "for molds; the printed screws are counted solid")
@@ -1589,7 +1896,9 @@ class CANDLE_OT_export(bpy.types.Operator):
         segs, step = QUALITY[props.export_quality]
         g = candle_geometry(p, segs, step, m.wick_diameter)
         check = run_split_check(context.scene) if m.mold_type == "SPLIT" else None
-        parts = mold_parts(p, m, g, check["angle"] if check else None)
+        wedge = run_wedge_check(context.scene) if m.mold_type == "WEDGE" else None
+        parts = mold_parts(p, m, g, check["angle"] if check else None,
+                           wedge and (wedge["pieces"], wedge["angle"]))
         if props.export_candle and m.mold_type != "NONE":
             parts.append(("candle", place_for_print(build_candle(g))))
         folder = _export_dir(props)
@@ -1617,6 +1926,11 @@ class CANDLE_OT_export(bpy.types.Operator):
             if not check["ok"]:
                 msg += (f". WARNING: this shape locks in a two-part mold "
                         f"({check['trapped']:.1f} mm undercut, red areas)")
+        if wedge is not None:
+            msg += f". {wedge['pieces']} wedges + plug: hold them with rubber bands in the grooves"
+            if not wedge["ok"]:
+                msg += (f". WARNING: this shape locks in {wedge['pieces']} wedges "
+                        f"({wedge['trapped']:.1f} mm undercut, red areas)")
         if props.open_bambu:
             printable = [w for w in written if not w.endswith("_candle.stl")] or written
             if not open_in_bambu(printable):
@@ -1755,6 +2069,10 @@ class CANDLE_PT_mold(_Panel, bpy.types.Panel):
             hint = ("Print both halves lying on their backs,",
                     "seam side up: no supports needed.")
             names = ("wick_diameter", "split_wall", "split_floor", "fastener")
+        elif t == "WEDGE":
+            hint = ("Print the wedges standing, pour end down,",
+                    "the plug face up. Rubber bands hold it.")
+            names = ("wick_diameter", "split_wall", "split_floor")
         elif t == "FLEX":
             hint = ("Print in TPU 95A, floor on the bed.",
                     "The rim lets it hang in a jar while pouring.")
@@ -1773,6 +2091,13 @@ class CANDLE_PT_mold(_Panel, bpy.types.Panel):
             sub = row.row(align=True)
             sub.enabled = not props.split_auto
             sub.prop(props, "split_angle", text="Seam")
+        if t == "WEDGE":
+            row = layout.row(align=True)
+            row.prop(props, "wedge_auto", toggle=True)
+            sub = row.row(align=True)
+            sub.enabled = not props.wedge_auto
+            sub.prop(props, "wedge_count")
+        if t in ("SPLIT", "WEDGE"):
             layout.prop(props, "show_locks")
         box = layout.box().column(align=True)
         for line in hint:
@@ -1788,7 +2113,21 @@ class CANDLE_PT_mold(_Panel, bpy.types.Panel):
                 if props.twist_turns or props.sway_angle:
                     box.label(text="Twisting or swaying ribs always lock.")
                 box.label(text="Try fewer, thinner or straight ribs,")
-                box.label(text="or use the Silicone or TPU mold.")
+                box.label(text="the wedge mold, or Silicone or TPU.")
+        if t == "WEDGE":
+            res = _stats.get("wedge")
+            if res is None:
+                box.label(text="Checking whether it releases...", icon="TIME")
+            elif res["ok"]:
+                box.label(text=f"Releases cleanly in {res['pieces']} pieces", icon="CHECKMARK")
+            else:
+                box.label(text=f"Locks{' even' if props.wedge_auto else ''} in {res['pieces']} pieces: "
+                               f"{res['trapped']:.1f} mm (red)", icon="ERROR")
+                if props.wedge_auto:
+                    box.label(text="Try shallower or fewer ribs,")
+                    box.label(text="or use the Silicone or TPU mold.")
+                else:
+                    box.label(text="Try more pieces, or Auto Pieces.")
         if t in PRINT_MATERIAL:
             parts = _stats.get("print")
             if parts is None:
@@ -1799,7 +2138,11 @@ class CANDLE_PT_mold(_Panel, bpy.types.Panel):
                                                         density)) for name, v, a, solid in parts]
                 box.label(text=f"Print: about {sum(g for _, g in grams):.0f} g {material}",
                           icon="MOD_BUILD")
-                if len(grams) > 1:
+                if t == "WEDGE":  # one line, however many wedges
+                    each = [g for n, g in grams if n.startswith("wedge")]
+                    box.label(text=f"{len(each)} wedges {min(each):.0f}-{max(each):.0f} g each, "
+                                   f"plug {grams[-1][1]:.0f} g")
+                elif len(grams) > 1:
                     box.label(text=", ".join(f"{n} {g:.0f} g" for n, g in grams))
             box.prop(props, "infill", text="Infill for estimate")
         if t == "RIGID":

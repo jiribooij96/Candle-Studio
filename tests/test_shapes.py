@@ -86,6 +86,7 @@ CONFIGS = {
     "faded folds": dict(ribs=9, rib_depth=6, rib_fullness=-0.3, rib_lean=0.6, twist_turns=0.8,
                         twist_focus=0.9, fade_bottom=15, fade_top=40),
 }
+WEDGE_CONFIGS = ("default ribs", "ribbed twist", "rope corkscrew")  # wedges for a few, they take longer
 t0 = time.time()
 for name in cs.BASE_SHAPES:
     if name == "ROUND":
@@ -95,7 +96,7 @@ for name in cs.BASE_SHAPES:
         m = mold(cs)
         g = cs.candle_geometry(p, 180, 0.8, m.wick_diameter)
         check_mesh(fails, cs.build_candle(g), f"{name}/{label}/candle")
-        for mt in ("SILICONE", "RIGID", "FLEX", "SPLIT"):
+        for mt in ("SILICONE", "RIGID", "FLEX", "SPLIT") + (("WEDGE",) if label in WEDGE_CONFIGS else ()):
             m.mold_type = mt
             for suffix, mesh in cs.mold_parts(p, m, g, 0.0 if mt == "SPLIT" else None):
                 if suffix != "screws_x4":

@@ -20,7 +20,7 @@ bpy.ops.candle.generate()
 
 for name in cs.BASE_SHAPES:
     props.base_shape = name
-    for mt in ("SILICONE", "SPLIT", "FLEX", "RIGID", "NONE"):
+    for mt in ("SILICONE", "SPLIT", "WEDGE", "FLEX", "RIGID", "NONE"):
         props.mold_type = mt
         draw_panels(cs, scene)
 fails.expect(True, "panels draw for every shape and mold type")
@@ -64,11 +64,12 @@ fails.expect(props.base_shape == "ROUND", "a design file without a shape loads a
 
 # filament estimate for every printed mold, and the panel while it's pending and done
 props.preset = "DEFAULT"
-for mt in ("SILICONE", "SPLIT", "FLEX", "RIGID", "NONE"):
+for mt in ("SILICONE", "SPLIT", "WEDGE", "FLEX", "RIGID", "NONE"):
     props.mold_type = mt
     draw_panels(cs, scene)  # "Estimating..."
     angle = cs.run_split_check(scene)["angle"] if mt == "SPLIT" else 0.0
-    parts = cs.run_print_estimate(scene, angle)
+    res = cs.run_wedge_check(scene) if mt == "WEDGE" else None
+    parts = cs.run_print_estimate(scene, angle, res and (res["pieces"], res["angle"]))
     draw_panels(cs, scene)
     if mt == "NONE":
         fails.expect(parts == [], "no estimate without a mold")

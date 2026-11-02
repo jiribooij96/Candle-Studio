@@ -15,7 +15,9 @@ fails = Failures()
 cs = load_addon()
 cs.register()
 
-# release check: these presets come out of two rigid halves, the rest lock
+# release check: these presets come out of two rigid halves, the rest lock.
+# Defaults releases: its only hook is a 0.06 mm sliver on the last ring of the
+# rounded top edge, thinner than the check counts
 released = set()
 t0 = time.time()
 for key in cs.PRESETS:
@@ -23,7 +25,7 @@ for key in cs.PRESETS:
     print(f"     {key:17s} seam {angle:5.1f} deg, worst undercut {trapped:5.2f} mm")
     if trapped <= cs.LOCK_TOL:
         released.add(key)
-expected = {"BUBBLE_STACK", "CURVY", "RIBBED_OVAL", "SQUARE_CUSHIONS"}
+expected = {"DEFAULT", "BUBBLE_STACK", "CURVY", "RIBBED_OVAL", "SQUARE_CUSHIONS"}
 fails.expect(released == expected, "the right presets release", str(sorted(released)))
 fails.expect(time.time() - t0 < 0.5 * len(cs.PRESETS), "release checks are quick",
              f"{time.time() - t0:.1f} s for {len(cs.PRESETS)}")

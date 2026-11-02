@@ -73,7 +73,7 @@ fails.expect(props.ribs == 7 and abs(props.sway_angle - 29) < 1e-6, "Load Design
              f"ribs {props.ribs}, sway {props.sway_angle:.1f}")
 bpy.ops.candle.randomize()
 
-for mt in ("SILICONE", "SPLIT", "FLEX", "RIGID", "NONE"):
+for mt in ("SILICONE", "SPLIT", "WEDGE", "FLEX", "RIGID", "NONE"):
     props.mold_type = mt
     draw_panels(cs, scene)
 fails.expect(True, "panels draw for every mold type")

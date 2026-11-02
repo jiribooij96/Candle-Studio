@@ -19,9 +19,10 @@ fails.expect("candle_studio" in bpy.context.preferences.addons, "add-on installs
 
 s = bpy.context.scene.candle_studio
 s.export_dir, s.open_bambu, s.export_quality = OUT, False, "DRAFT"
-designs = {"SILICONE": "RIBBED_OVAL", "SPLIT": "SQUARE_CUSHIONS", "FLEX": "TWISTED_TRIANGLE",
-           "RIGID": "TWISTED_HEX", "NONE": "CLASSIC_SWIRL"}
+designs = {"SILICONE": "RIBBED_OVAL", "SPLIT": "SQUARE_CUSHIONS", "WEDGE": "TWISTED_SQUARE",
+           "FLEX": "TWISTED_TRIANGLE", "RIGID": "TWISTED_HEX", "NONE": "CLASSIC_SWIRL"}
 expected = {"SILICONE": ["master", "sleeve"], "SPLIT": ["half_a", "half_b", "screws_x4"],
+            "WEDGE": ["wedge_1", "wedge_2", "wedge_3", "wedge_4", "plug"],
             "FLEX": ["mold_flex"], "RIGID": ["mold_rigid"], "NONE": ["candle"]}
 for mt, preset in designs.items():
     s.preset = preset
